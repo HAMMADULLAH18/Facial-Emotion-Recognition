@@ -8,7 +8,7 @@ import csv
 from datetime import datetime
 from collections import defaultdict, deque
 from PIL import Image
-from fer.fer import FER
+from deepface import DeepFace
 
 # ── Page config ───────────────────────────────────────────────
 st.set_page_config(
@@ -56,11 +56,30 @@ EMOTION_EMOJI = {
 
 os.makedirs("logs", exist_ok=True)
 
-@st.cache_resource
-def load_detector():
-    return FER(mtcnn=False)
-
-detector = load_detector()
+# ── DeepFace analyzer (replaces FER) ─────────────────────────
+def analyze_emotion(img_np):
+    """Takes RGB numpy array, returns list of face dicts."""
+    try:
+        raw = DeepFace.analyze(
+            img_np,
+            actions=['emotion'],
+            enforce_detection=False,
+            silent=True
+        )
+        results = []
+        for face in raw:
+            region = face.get('region', {})
+            x = region.get('x', 0)
+            y = region.get('y', 0)
+            w = region.get('w', img_np.shape[1])
+            h = region.get('h', img_np.shape[0])
+            # DeepFace gives scores 0-100, normalize to 0-1
+            emotions = {k: round(v / 100, 4)
+                        for k, v in face['emotion'].items()}
+            results.append({'box': [x, y, w, h], 'emotions': emotions})
+        return results
+    except Exception:
+        return []
 
 # ── Sidebar ───────────────────────────────────────────────────
 with st.sidebar:
@@ -132,8 +151,8 @@ if mode == "Photo Upload":
         img_np  = np.array(pil_img)
         frame   = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
 
-        with st.spinner("Analyzing..."):
-            results = detector.detect_emotions(frame)
+        with st.spinner("Analyzing emotions..."):
+            results = analyze_emotion(img_np)
 
         if results:
             for face in results:
@@ -289,9 +308,10 @@ else:
             fc = st.session_state.frame_count
 
             if fc % detect_every == 0:
-                small = cv2.resize(frame,(0,0),
-                                   fx=frame_scale,fy=frame_scale)
-                raw   = detector.detect_emotions(small)
+                frame_rgb = cv2.cvtColor(
+                    cv2.resize(frame,(0,0),fx=frame_scale,fy=frame_scale),
+                    cv2.COLOR_BGR2RGB)
+                raw = analyze_emotion(frame_rgb)
                 st.session_state.last_results = [{
                     'box':[int(f['box'][0]/frame_scale),
                            int(f['box'][1]/frame_scale),
@@ -353,14 +373,12 @@ else:
             counts = st.session_state.counts
             if counts:
                 with session_slot.container():
-                    total   = sum(counts.values())
                     top     = max(counts,key=counts.get)
                     avg_fps = np.mean(st.session_state.fps_history[-30:])
                     c1,c2,c3 = st.columns(3)
                     c1.metric("Frames",fc)
                     c2.metric("FPS",f"{avg_fps:.1f}")
-                    c3.metric("Mood",
-                              EMOTION_EMOJI.get(top,'')+top[:3])
+                    c3.metric("Mood",EMOTION_EMOJI.get(top,'')+top[:3])
                     st.bar_chart(pd.DataFrame({
                         'Emotion':list(counts.keys()),
                         'Frames':list(counts.values())
