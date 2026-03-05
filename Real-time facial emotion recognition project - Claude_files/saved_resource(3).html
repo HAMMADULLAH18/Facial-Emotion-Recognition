@@ -1,0 +1,1207 @@
+<!DOCTYPE html>
+<!-- saved from url=(0012)about:srcdoc -->
+<html lang="en"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+            }
+            const screenshot = await htmlToImage.toPng(rootElement, {
+              imagePlaceholder:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+            });
+            window.parent.postMessage({
+              type: 'screenshotData',
+              data: screenshot,
+            }, '*');
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FER — Real-Time Facial Emotion Recognition</title>
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&amp;family=JetBrains+Mono:wght@300;400;500&amp;display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0a0a0f;
+    --surface: #111118;
+    --surface2: #1a1a24;
+    --border: #2a2a3a;
+    --accent: #7c3aed;
+    --accent2: #06b6d4;
+    --accent3: #f59e0b;
+    --text: #e8e8f0;
+    --muted: #6b6b85;
+    --happy: #22c55e;
+    --sad: #3b82f6;
+    --angry: #ef4444;
+    --neutral: #94a3b8;
+    --surprise: #f59e0b;
+    --fear: #a855f7;
+    --disgust: #84cc16;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'JetBrains Mono', monospace;
+    line-height: 1.7;
+    overflow-x: hidden;
+  }
+
+  /* Grid noise texture overlay */
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background-image:
+      radial-gradient(ellipse 80% 50% at 20% 20%, rgba(124,58,237,0.08) 0%, transparent 60%),
+      radial-gradient(ellipse 60% 40% at 80% 80%, rgba(6,182,212,0.06) 0%, transparent 60%);
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  .wrap { max-width: 900px; margin: 0 auto; padding: 0 2rem; position: relative; z-index: 1; }
+
+  /* ── HERO ── */
+  header {
+    padding: 5rem 0 4rem;
+    border-bottom: 1px solid var(--border);
+    position: relative;
+  }
+
+  .badge {
+    display: inline-flex; align-items: center; gap: 0.5rem;
+    background: rgba(124,58,237,0.15);
+    border: 1px solid rgba(124,58,237,0.4);
+    color: #a78bfa;
+    font-size: 0.7rem; letter-spacing: 0.12em; text-transform: uppercase;
+    padding: 0.35rem 0.85rem; border-radius: 2px;
+    margin-bottom: 1.5rem;
+  }
+  .badge::before { content: '◆'; font-size: 0.5rem; }
+
+  h1 {
+    font-family: 'Syne', sans-serif;
+    font-size: clamp(2.2rem, 5vw, 3.8rem);
+    font-weight: 800;
+    line-height: 1.05;
+    letter-spacing: -0.02em;
+    margin-bottom: 1.2rem;
+  }
+
+  h1 span.hl {
+    background: linear-gradient(135deg, #7c3aed, #06b6d4);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+
+  .hero-desc {
+    color: var(--muted);
+    font-size: 0.88rem;
+    max-width: 560px;
+    margin-bottom: 2.5rem;
+  }
+
+  .emotion-pills {
+    display: flex; flex-wrap: wrap; gap: 0.6rem;
+  }
+  .pill {
+    padding: 0.3rem 0.9rem;
+    border-radius: 2px;
+    font-size: 0.72rem;
+    font-weight: 500;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    border: 1px solid;
+    animation: pulse-pill 3s ease-in-out infinite;
+  }
+  .pill:nth-child(1) { background: rgba(34,197,94,0.1); border-color: rgba(34,197,94,0.4); color: #4ade80; animation-delay: 0s; }
+  .pill:nth-child(2) { background: rgba(59,130,246,0.1); border-color: rgba(59,130,246,0.4); color: #60a5fa; animation-delay: 0.4s; }
+  .pill:nth-child(3) { background: rgba(239,68,68,0.1);  border-color: rgba(239,68,68,0.4);  color: #f87171; animation-delay: 0.8s; }
+  .pill:nth-child(4) { background: rgba(148,163,184,0.1);border-color: rgba(148,163,184,0.4);color: #cbd5e1; animation-delay: 1.2s; }
+  .pill:nth-child(5) { background: rgba(245,158,11,0.1); border-color: rgba(245,158,11,0.4); color: #fbbf24; animation-delay: 1.6s; }
+  .pill:nth-child(6) { background: rgba(168,85,247,0.1); border-color: rgba(168,85,247,0.4); color: #c084fc; animation-delay: 2.0s; }
+  .pill:nth-child(7) { background: rgba(132,204,22,0.1); border-color: rgba(132,204,22,0.4); color: #a3e635; animation-delay: 2.4s; }
+
+  @keyframes pulse-pill {
+    0%, 100% { opacity: 0.6; transform: translateY(0); }
+    50% { opacity: 1; transform: translateY(-1px); }
+  }
+
+  /* ── NAV / TOC ── */
+  .toc {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    padding: 1.5rem 1.8rem;
+    margin: 3rem 0;
+    border-radius: 0 4px 4px 0;
+  }
+  .toc-title {
+    font-family: 'Syne', sans-serif;
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    color: var(--accent2);
+    margin-bottom: 1rem;
+  }
+  .toc ol { padding-left: 1.2rem; }
+  .toc li { margin: 0.35rem 0; }
+  .toc a {
+    color: var(--muted);
+    text-decoration: none;
+    font-size: 0.8rem;
+    transition: color 0.2s;
+  }
+  .toc a:hover { color: var(--text); }
+  .toc a::before { content: '→ '; color: var(--accent); font-size: 0.75rem; }
+
+  /* ── SECTIONS ── */
+  section {
+    padding: 3.5rem 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .section-num {
+    font-size: 0.65rem;
+    color: var(--accent);
+    text-transform: uppercase;
+    letter-spacing: 0.15em;
+    margin-bottom: 0.5rem;
+  }
+
+  h2 {
+    font-family: 'Syne', sans-serif;
+    font-size: 1.6rem;
+    font-weight: 700;
+    margin-bottom: 1.5rem;
+    letter-spacing: -0.01em;
+  }
+
+  h3 {
+    font-family: 'Syne', sans-serif;
+    font-size: 1.05rem;
+    font-weight: 600;
+    color: var(--accent2);
+    margin: 1.8rem 0 0.8rem;
+  }
+
+  p { color: #c0c0d0; font-size: 0.85rem; margin-bottom: 1rem; }
+
+  /* ── ARCHITECTURE DIAGRAM ── */
+  .pipeline {
+    display: flex;
+    align-items: center;
+    gap: 0;
+    flex-wrap: wrap;
+    margin: 2rem 0;
+    row-gap: 1rem;
+  }
+  .pipe-step {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    padding: 1rem 1.2rem;
+    flex: 1;
+    min-width: 100px;
+    text-align: center;
+    position: relative;
+    transition: all 0.2s;
+    cursor: default;
+  }
+  .pipe-step:hover {
+    border-color: var(--accent);
+    background: rgba(124,58,237,0.08);
+  }
+  .pipe-step .icon { font-size: 1.4rem; margin-bottom: 0.4rem; }
+  .pipe-step .label { font-size: 0.7rem; color: var(--text); font-weight: 500; }
+  .pipe-step .sub { font-size: 0.62rem; color: var(--muted); margin-top: 0.2rem; }
+  .pipe-arrow {
+    color: var(--accent);
+    font-size: 1rem;
+    padding: 0 0.3rem;
+    flex-shrink: 0;
+  }
+
+  /* ── FILE STRUCTURE ── */
+  .file-tree {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1.5rem;
+    font-size: 0.78rem;
+    line-height: 2;
+  }
+  .ft-folder { color: var(--accent3); }
+  .ft-py { color: var(--accent2); }
+  .ft-txt { color: var(--muted); }
+  .ft-comment { color: #4a4a6a; font-style: italic; }
+  .ft-indent1 { padding-left: 1.4rem; }
+  .ft-indent2 { padding-left: 2.8rem; }
+
+  /* ── CODE BLOCKS ── */
+  .code-block {
+    background: #0d0d16;
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent2);
+    border-radius: 0 4px 4px 0;
+    padding: 1.4rem 1.6rem;
+    overflow-x: auto;
+    margin: 1.2rem 0;
+    position: relative;
+  }
+  .code-block .filename {
+    position: absolute; top: 0.6rem; right: 1rem;
+    font-size: 0.65rem; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.08em;
+  }
+  pre { font-size: 0.78rem; line-height: 1.8; }
+  .kw { color: #a78bfa; }
+  .fn { color: #38bdf8; }
+  .st { color: #86efac; }
+  .cm { color: #4a5568; font-style: italic; }
+  .nm { color: #fbbf24; }
+  .op { color: #f472b6; }
+
+  /* ── STEP CARDS ── */
+  .steps { display: flex; flex-direction: column; gap: 1rem; margin: 1.5rem 0; }
+  .step-card {
+    display: flex; gap: 1.2rem;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    padding: 1.2rem 1.4rem;
+    border-radius: 4px;
+    transition: border-color 0.2s;
+  }
+  .step-card:hover { border-color: var(--accent); }
+  .step-num {
+    width: 2rem; height: 2rem;
+    background: rgba(124,58,237,0.2);
+    border: 1px solid rgba(124,58,237,0.5);
+    color: #a78bfa;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 0.75rem; font-weight: 700;
+    flex-shrink: 0;
+    border-radius: 2px;
+  }
+  .step-content h4 {
+    font-family: 'Syne', sans-serif;
+    font-size: 0.9rem;
+    margin-bottom: 0.3rem;
+  }
+  .step-content p { margin: 0; font-size: 0.78rem; }
+
+  /* ── PACKAGES TABLE ── */
+  .pkg-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    gap: 0.8rem;
+    margin: 1.2rem 0;
+  }
+  .pkg-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    padding: 1rem;
+    border-radius: 4px;
+    transition: all 0.2s;
+  }
+  .pkg-card:hover { border-color: var(--accent2); }
+  .pkg-name { color: var(--accent2); font-size: 0.82rem; font-weight: 500; margin-bottom: 0.3rem; }
+  .pkg-use { color: var(--muted); font-size: 0.72rem; }
+  .pkg-version { color: var(--accent3); font-size: 0.68rem; margin-top: 0.3rem; }
+
+  /* ── PHASE TIMELINE ── */
+  .timeline { position: relative; padding-left: 2rem; margin: 1.5rem 0; }
+  .timeline::before {
+    content: '';
+    position: absolute; left: 0.4rem; top: 0; bottom: 0;
+    width: 1px; background: linear-gradient(to bottom, var(--accent), var(--accent2), transparent);
+  }
+  .tl-item { position: relative; margin-bottom: 1.5rem; }
+  .tl-dot {
+    position: absolute; left: -1.65rem; top: 0.35rem;
+    width: 0.7rem; height: 0.7rem;
+    background: var(--accent);
+    border-radius: 50%;
+    box-shadow: 0 0 8px rgba(124,58,237,0.6);
+  }
+  .tl-phase {
+    font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.1em;
+    color: var(--accent); margin-bottom: 0.3rem;
+  }
+  .tl-title {
+    font-family: 'Syne', sans-serif;
+    font-size: 0.95rem; font-weight: 600;
+    margin-bottom: 0.4rem;
+  }
+  .tl-desc { font-size: 0.78rem; color: var(--muted); }
+
+  /* ── TIPS / CALLOUTS ── */
+  .callout {
+    padding: 1rem 1.3rem;
+    border-radius: 0 4px 4px 0;
+    margin: 1.2rem 0;
+    font-size: 0.8rem;
+  }
+  .callout.tip {
+    background: rgba(6,182,212,0.08);
+    border-left: 3px solid var(--accent2);
+    color: #a5f3fc;
+  }
+  .callout.warn {
+    background: rgba(245,158,11,0.08);
+    border-left: 3px solid var(--accent3);
+    color: #fde68a;
+  }
+  .callout.info {
+    background: rgba(124,58,237,0.08);
+    border-left: 3px solid var(--accent);
+    color: #ddd6fe;
+  }
+  .callout strong { font-weight: 600; }
+
+  /* ── MODEL COMPARISON ── */
+  .model-table { width: 100%; border-collapse: collapse; font-size: 0.76rem; margin: 1rem 0; }
+  .model-table th {
+    background: var(--surface2);
+    color: var(--accent2);
+    text-align: left;
+    padding: 0.7rem 1rem;
+    font-weight: 500;
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    border-bottom: 1px solid var(--border);
+  }
+  .model-table td {
+    padding: 0.7rem 1rem;
+    border-bottom: 1px solid rgba(42,42,58,0.5);
+    color: #c0c0d0;
+    vertical-align: top;
+  }
+  .model-table tr:hover td { background: rgba(124,58,237,0.04); }
+  .tag-rec {
+    background: rgba(34,197,94,0.15);
+    border: 1px solid rgba(34,197,94,0.3);
+    color: #4ade80;
+    font-size: 0.65rem;
+    padding: 0.15rem 0.5rem;
+    border-radius: 2px;
+    white-space: nowrap;
+  }
+
+  /* ── LOGGING / STATS ── */
+  .stat-row { display: flex; gap: 1rem; flex-wrap: wrap; margin: 1rem 0; }
+  .stat-box {
+    flex: 1; min-width: 120px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    padding: 1rem;
+    border-radius: 4px;
+    text-align: center;
+  }
+  .stat-box .val { font-size: 1.8rem; font-family: 'Syne', sans-serif; font-weight: 800; }
+  .stat-box .lbl { font-size: 0.65rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.1em; }
+
+  /* ── FOOTER ── */
+  footer {
+    padding: 3rem 0;
+    text-align: center;
+    color: var(--muted);
+    font-size: 0.72rem;
+  }
+
+  /* Scrollbar */
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: var(--bg); }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+</style>
+</head>
+<body id="artifacts-component-root-html">
+<div class="wrap">
+
+<!-- HERO -->
+<header>
+  <div class="badge">Computer Vision Project Guide</div>
+  <h1>Real-Time <span class="hl">Facial Emotion</span><br>Recognition</h1>
+  <p class="hero-desc">
+    Webcam → Face Detection → Deep Learning Inference → Live Overlay + Stats Logging.
+    A full walkthrough from setup to deployment.
+  </p>
+  <div class="emotion-pills">
+    <span class="pill">😄 Happy</span>
+    <span class="pill">😢 Sad</span>
+    <span class="pill">😠 Angry</span>
+    <span class="pill">😐 Neutral</span>
+    <span class="pill">😲 Surprise</span>
+    <span class="pill">😨 Fear</span>
+    <span class="pill">🤢 Disgust</span>
+  </div>
+</header>
+
+<!-- TOC -->
+<div class="toc">
+  <div class="toc-title">// Table of Contents</div>
+  <ol>
+    <li><a href="https://www.claudeusercontent.com/?domain=claude.ai&amp;errorReportingMode=parent&amp;formattedSpreadsheets=true#overview">System Overview &amp; Architecture</a></li>
+    <li><a href="https://www.claudeusercontent.com/?domain=claude.ai&amp;errorReportingMode=parent&amp;formattedSpreadsheets=true#setup">Environment Setup &amp; Dependencies</a></li>
+    <li><a href="https://www.claudeusercontent.com/?domain=claude.ai&amp;errorReportingMode=parent&amp;formattedSpreadsheets=true#structure">Project File Structure</a></li>
+    <li><a href="https://www.claudeusercontent.com/?domain=claude.ai&amp;errorReportingMode=parent&amp;formattedSpreadsheets=true#phase1">Phase 1 — Webcam Capture &amp; Face Detection</a></li>
+    <li><a href="https://www.claudeusercontent.com/?domain=claude.ai&amp;errorReportingMode=parent&amp;formattedSpreadsheets=true#phase2">Phase 2 — Emotion Classification Model</a></li>
+    <li><a href="https://www.claudeusercontent.com/?domain=claude.ai&amp;errorReportingMode=parent&amp;formattedSpreadsheets=true#phase3">Phase 3 — Live Overlay &amp; Display</a></li>
+    <li><a href="https://www.claudeusercontent.com/?domain=claude.ai&amp;errorReportingMode=parent&amp;formattedSpreadsheets=true#phase4">Phase 4 — Stats Logging &amp; Analytics</a></li>
+    <li><a href="https://www.claudeusercontent.com/?domain=claude.ai&amp;errorReportingMode=parent&amp;formattedSpreadsheets=true#models">Model Options &amp; Comparison</a></li>
+    <li><a href="https://www.claudeusercontent.com/?domain=claude.ai&amp;errorReportingMode=parent&amp;formattedSpreadsheets=true#roadmap">Roadmap &amp; Enhancements</a></li>
+  </ol>
+</div>
+
+<!-- SECTION 1: OVERVIEW -->
+<section id="overview">
+  <div class="section-num">// 01</div>
+  <h2>System Overview &amp; Architecture</h2>
+  <p>The system forms a real-time inference pipeline — each webcam frame flows through face detection, preprocessing, emotion prediction, and visualization, all running within a single loop at 20–30 FPS.</p>
+
+  <div class="pipeline">
+    <div class="pipe-step">
+      <div class="icon">📷</div>
+      <div class="label">Webcam</div>
+      <div class="sub">OpenCV VideoCapture</div>
+    </div>
+    <div class="pipe-arrow">▶</div>
+    <div class="pipe-step">
+      <div class="icon">🔍</div>
+      <div class="label">Face Detection</div>
+      <div class="sub">Haar / MTCNN / dlib</div>
+    </div>
+    <div class="pipe-arrow">▶</div>
+    <div class="pipe-step">
+      <div class="icon">⚙️</div>
+      <div class="label">Preprocess</div>
+      <div class="sub">48×48 Grayscale</div>
+    </div>
+    <div class="pipe-arrow">▶</div>
+    <div class="pipe-step">
+      <div class="icon">🧠</div>
+      <div class="label">CNN Model</div>
+      <div class="sub">FER+ / DeepFace</div>
+    </div>
+    <div class="pipe-arrow">▶</div>
+    <div class="pipe-step">
+      <div class="icon">🖥️</div>
+      <div class="label">Live Overlay</div>
+      <div class="sub">Label + Confidence</div>
+    </div>
+    <div class="pipe-arrow">▶</div>
+    <div class="pipe-step">
+      <div class="icon">📊</div>
+      <div class="label">Stats Logger</div>
+      <div class="sub">CSV / JSON / Plot</div>
+    </div>
+  </div>
+
+  <div class="callout info">
+    <strong>Core Loop:</strong> Everything runs inside a <code>while True</code> loop reading frames from <code>cv2.VideoCapture(0)</code>. Target frame processing time is &lt;50ms to stay above 20 FPS.
+  </div>
+</section>
+
+<!-- SECTION 2: SETUP -->
+<section id="setup">
+  <div class="section-num">// 02</div>
+  <h2>Environment Setup &amp; Dependencies</h2>
+
+  <h3>1. Create Virtual Environment</h3>
+  <div class="code-block">
+    <span class="filename">terminal</span>
+    <pre><span class="cm"># Python 3.8+ recommended</span>
+<span class="fn">python</span> -m venv fer_env
+<span class="cm"># Windows:</span>
+fer_env\Scripts\<span class="fn">activate</span>
+<span class="cm"># Mac/Linux:</span>
+<span class="fn">source</span> fer_env/bin/activate</pre>
+  </div>
+
+  <h3>2. Install Packages</h3>
+  <div class="code-block">
+    <span class="filename">terminal</span>
+    <pre><span class="fn">pip install</span> opencv-python numpy tensorflow deepface \
+            fer matplotlib pandas pillow tqdm</pre>
+  </div>
+
+  <div class="pkg-grid">
+    <div class="pkg-card">
+      <div class="pkg-name">opencv-python</div>
+      <div class="pkg-use">Webcam capture, drawing overlays, image ops</div>
+      <div class="pkg-version">≥ 4.8</div>
+    </div>
+    <div class="pkg-card">
+      <div class="pkg-name">tensorflow / keras</div>
+      <div class="pkg-use">Load &amp; run CNN emotion model</div>
+      <div class="pkg-version">≥ 2.12</div>
+    </div>
+    <div class="pkg-card">
+      <div class="pkg-name">deepface</div>
+      <div class="pkg-use">High-level face analysis (alternative approach)</div>
+      <div class="pkg-version">≥ 0.0.79</div>
+    </div>
+    <div class="pkg-card">
+      <div class="pkg-name">fer</div>
+      <div class="pkg-use">Lightweight FER library with pretrained model</div>
+      <div class="pkg-version">≥ 22.5</div>
+    </div>
+    <div class="pkg-card">
+      <div class="pkg-name">numpy</div>
+      <div class="pkg-use">Array ops, image data manipulation</div>
+      <div class="pkg-version">≥ 1.24</div>
+    </div>
+    <div class="pkg-card">
+      <div class="pkg-name">matplotlib / pandas</div>
+      <div class="pkg-use">Stats plotting, CSV log analysis</div>
+      <div class="pkg-version">latest</div>
+    </div>
+  </div>
+
+  <div class="callout warn">
+    <strong>GPU Note:</strong> For real-time speed, install <code>tensorflow-gpu</code> and CUDA 11.x if you have an NVIDIA GPU. CPU inference is fine for testing but may drop below 15 FPS.
+  </div>
+</section>
+
+<!-- SECTION 3: FILE STRUCTURE -->
+<section id="structure">
+  <div class="section-num">// 03</div>
+  <h2>Project File Structure</h2>
+  <div class="file-tree">
+    <div><span class="ft-folder">📁 fer_project/</span></div>
+    <div class="ft-indent1"><span class="ft-folder">📁 models/</span> <span class="ft-comment">— saved model weights</span></div>
+    <div class="ft-indent2"><span class="ft-py">emotion_model.h5</span> <span class="ft-comment">— FER+ trained CNN</span></div>
+    <div class="ft-indent1"><span class="ft-folder">📁 logs/</span> <span class="ft-comment">— runtime output</span></div>
+    <div class="ft-indent2"><span class="ft-txt">emotion_log.csv</span> <span class="ft-comment">— timestamped predictions</span></div>
+    <div class="ft-indent2"><span class="ft-txt">session_summary.json</span> <span class="ft-comment">— aggregated stats</span></div>
+    <div class="ft-indent1"><span class="ft-folder">📁 utils/</span></div>
+    <div class="ft-indent2"><span class="ft-py">face_detector.py</span> <span class="ft-comment">— face detection helpers</span></div>
+    <div class="ft-indent2"><span class="ft-py">preprocessor.py</span> <span class="ft-comment">— image normalization</span></div>
+    <div class="ft-indent2"><span class="ft-py">logger.py</span> <span class="ft-comment">— stats &amp; CSV writer</span></div>
+    <div class="ft-indent2"><span class="ft-py">overlay.py</span> <span class="ft-comment">— drawing functions</span></div>
+    <div class="ft-indent1"><span class="ft-py">main.py</span> <span class="ft-comment">— 🚀 entry point, main loop</span></div>
+    <div class="ft-indent1"><span class="ft-py">model_loader.py</span> <span class="ft-comment">— load / init model</span></div>
+    <div class="ft-indent1"><span class="ft-py">analyze_logs.py</span> <span class="ft-comment">— post-session analytics</span></div>
+    <div class="ft-indent1"><span class="ft-txt">requirements.txt</span></div>
+    <div class="ft-indent1"><span class="ft-txt">README.md</span></div>
+  </div>
+</section>
+
+<!-- SECTION 4: PHASE 1 -->
+<section id="phase1">
+  <div class="section-num">// 04</div>
+  <h2>Phase 1 — Webcam Capture &amp; Face Detection</h2>
+  <p>Start by getting frames from the webcam and detecting face bounding boxes. OpenCV's Haar Cascade is the quickest entry point; upgrade to MTCNN for accuracy.</p>
+
+  <div class="code-block">
+    <span class="filename">utils/face_detector.py</span>
+    <pre><span class="kw">import</span> cv2
+<span class="kw">import</span> numpy <span class="kw">as</span> np
+
+<span class="cm"># Load OpenCV Haar Cascade (built-in, no download needed)</span>
+face_cascade = cv2.<span class="fn">CascadeClassifier</span>(
+    cv2.data.haarcascades + <span class="st">'haarcascade_frontalface_default.xml'</span>
+)
+
+<span class="kw">def</span> <span class="fn">detect_faces</span>(frame):
+    <span class="st">"""Returns list of (x, y, w, h) bounding boxes."""</span>
+    gray = cv2.<span class="fn">cvtColor</span>(frame, cv2.COLOR_BGR2GRAY)
+    faces = face_cascade.<span class="fn">detectMultiScale</span>(
+        gray,
+        scaleFactor=<span class="nm">1.1</span>,
+        minNeighbors=<span class="nm">5</span>,
+        minSize=(<span class="nm">48</span>, <span class="nm">48</span>)
+    )
+    <span class="kw">return</span> faces <span class="kw">if</span> <span class="fn">len</span>(faces) <span class="op">&gt;</span> <span class="nm">0</span> <span class="kw">else</span> []
+
+<span class="kw">def</span> <span class="fn">crop_face</span>(frame, x, y, w, h, target=(<span class="nm">48</span>, <span class="nm">48</span>)):
+    <span class="st">"""Crop + resize + grayscale a face ROI for model input."""</span>
+    gray = cv2.<span class="fn">cvtColor</span>(frame, cv2.COLOR_BGR2GRAY)
+    roi  = gray[y:y+h, x:x+w]
+    roi  = cv2.<span class="fn">resize</span>(roi, target)
+    roi  = roi.astype(<span class="st">'float32'</span>) / <span class="nm">255.0</span>
+    roi  = np.<span class="fn">expand_dims</span>(roi, axis=(<span class="nm">0</span>, -<span class="nm">1</span>)) <span class="cm"># (1, 48, 48, 1)</span>
+    <span class="kw">return</span> roi</pre>
+  </div>
+
+  <div class="callout tip">
+    <strong>Tip:</strong> For multi-face detection or profile faces, switch to <code>from mtcnn import MTCNN; detector = MTCNN()</code>. It handles rotated/angled faces far better than Haar Cascade.
+  </div>
+</section>
+
+<!-- SECTION 5: PHASE 2 -->
+<section id="phase2">
+  <div class="section-num">// 05</div>
+  <h2>Phase 2 — Emotion Classification Model</h2>
+  <p>Two main approaches: use a pre-built library (fastest to start), or load a custom trained <code>.h5</code> model on the FER-2013 dataset (more control).</p>
+
+  <h3>Option A — Using the <code>fer</code> library (Recommended for Beginners)</h3>
+  <div class="code-block">
+    <span class="filename">model_loader.py — approach A</span>
+    <pre><span class="kw">from</span> fer <span class="kw">import</span> FER
+<span class="kw">import</span> cv2
+
+detector = <span class="fn">FER</span>(mtcnn=<span class="kw">True</span>)  <span class="cm"># uses MTCNN under the hood</span>
+
+<span class="kw">def</span> <span class="fn">predict</span>(frame):
+    result = detector.<span class="fn">detect_emotions</span>(frame)
+    <span class="kw">if not</span> result:
+        <span class="kw">return</span> <span class="kw">None</span>
+    emotions = result[<span class="nm">0</span>][<span class="st">'emotions'</span>]      <span class="cm"># dict of 7 scores</span>
+    top_emotion = <span class="fn">max</span>(emotions, key=emotions.get)
+    confidence  = emotions[top_emotion]
+    <span class="kw">return</span> top_emotion, confidence, emotions, result[<span class="nm">0</span>][<span class="st">'box'</span>]</pre>
+  </div>
+
+  <h3>Option B — Custom Keras CNN on FER-2013</h3>
+  <div class="code-block">
+    <span class="filename">model_loader.py — approach B</span>
+    <pre><span class="kw">from</span> tensorflow.keras.models <span class="kw">import</span> load_model
+<span class="kw">import</span> numpy <span class="kw">as</span> np
+
+LABELS = [<span class="st">'angry'</span>,<span class="st">'disgust'</span>,<span class="st">'fear'</span>,<span class="st">'happy'</span>,<span class="st">'neutral'</span>,<span class="st">'sad'</span>,<span class="st">'surprise'</span>]
+model  = <span class="fn">load_model</span>(<span class="st">'models/emotion_model.h5'</span>)
+
+<span class="kw">def</span> <span class="fn">predict_from_roi</span>(roi):
+    <span class="st">"""roi shape: (1, 48, 48, 1), normalized 0-1"""</span>
+    preds = model.<span class="fn">predict</span>(roi, verbose=<span class="nm">0</span>)[<span class="nm">0</span>]   <span class="cm"># shape (7,)</span>
+    idx   = np.<span class="fn">argmax</span>(preds)
+    <span class="kw">return</span> LABELS[idx], <span class="fn">float</span>(preds[idx]), <span class="fn">dict</span>(<span class="fn">zip</span>(LABELS, preds))</pre>
+  </div>
+
+  <div class="callout info">
+    <strong>Where to get a pretrained model:</strong> Search for "FER2013 pretrained h5" on Kaggle or HuggingFace. A well-trained VGG-style CNN on FER-2013 achieves ~65–72% test accuracy — this is near the human-level ceiling on that dataset.
+  </div>
+</section>
+
+<!-- SECTION 6: PHASE 3 -->
+<section id="phase3">
+  <div class="section-num">// 06</div>
+  <h2>Phase 3 — Live Overlay &amp; Display</h2>
+  <p>Draw bounding boxes, emotion labels, confidence bars, and optional mini emotion histograms directly onto OpenCV frames.</p>
+
+  <div class="code-block">
+    <span class="filename">utils/overlay.py</span>
+    <pre><span class="kw">import</span> cv2
+
+COLORS = {
+    <span class="st">'happy'</span>:    (<span class="nm">50</span>,  <span class="nm">205</span>, <span class="nm">50</span>),
+    <span class="st">'sad'</span>:      (<span class="nm">220</span>, <span class="nm">100</span>, <span class="nm">30</span>),
+    <span class="st">'angry'</span>:    (<span class="nm">30</span>,  <span class="nm">30</span>,  <span class="nm">220</span>),
+    <span class="st">'neutral'</span>:  (<span class="nm">180</span>, <span class="nm">180</span>, <span class="nm">180</span>),
+    <span class="st">'surprise'</span>: (<span class="nm">30</span>,  <span class="nm">200</span>, <span class="nm">220</span>),
+    <span class="st">'fear'</span>:     (<span class="nm">180</span>, <span class="nm">60</span>,  <span class="nm">220</span>),
+    <span class="st">'disgust'</span>:  (<span class="nm">60</span>,  <span class="nm">180</span>, <span class="nm">30</span>),
+}
+
+<span class="kw">def</span> <span class="fn">draw_face</span>(frame, x, y, w, h, emotion, conf):
+    color = COLORS.get(emotion, (<span class="nm">255</span>,<span class="nm">255</span>,<span class="nm">255</span>))
+    <span class="cm"># Bounding box</span>
+    cv2.<span class="fn">rectangle</span>(frame, (x,y), (x+w,y+h), color, <span class="nm">2</span>)
+    <span class="cm"># Label background</span>
+    label = <span class="st">f"{emotion.upper()}  {conf*100:.1f}%"</span>
+    (tw, th), _ = cv2.<span class="fn">getTextSize</span>(label, cv2.FONT_HERSHEY_SIMPLEX, <span class="nm">0.6</span>, <span class="nm">2</span>)
+    cv2.<span class="fn">rectangle</span>(frame, (x, y-th-<span class="nm">10</span>), (x+tw+<span class="nm">8</span>, y), color, -<span class="nm">1</span>)
+    cv2.<span class="fn">putText</span>(frame, label, (x+<span class="nm">4</span>, y-<span class="nm">6</span>),
+                cv2.FONT_HERSHEY_SIMPLEX, <span class="nm">0.6</span>, (<span class="nm">0</span>,<span class="nm">0</span>,<span class="nm">0</span>), <span class="nm">2</span>)
+    <span class="cm"># Confidence bar</span>
+    bar_w = <span class="fn">int</span>(w * conf)
+    cv2.<span class="fn">rectangle</span>(frame, (x, y+h+<span class="nm">4</span>), (x+bar_w, y+h+<span class="nm">12</span>), color, -<span class="nm">1</span>)
+    cv2.<span class="fn">rectangle</span>(frame, (x, y+h+<span class="nm">4</span>), (x+w,     y+h+<span class="nm">12</span>), color,  <span class="nm">1</span>)
+
+<span class="kw">def</span> <span class="fn">draw_fps</span>(frame, fps):
+    cv2.<span class="fn">putText</span>(frame, <span class="st">f"FPS: {fps:.1f}"</span>, (<span class="nm">10</span>,<span class="nm">25</span>),
+                cv2.FONT_HERSHEY_SIMPLEX, <span class="nm">0.6</span>, (<span class="nm">0</span>,<span class="nm">255</span>,<span class="nm">0</span>), <span class="nm">2</span>)</pre>
+  </div>
+
+  <h3>Main Loop</h3>
+  <div class="code-block">
+    <span class="filename">main.py</span>
+    <pre><span class="kw">import</span> cv2, time
+<span class="kw">from</span> utils.face_detector <span class="kw">import</span> detect_faces, crop_face
+<span class="kw">from</span> model_loader <span class="kw">import</span> predict_from_roi
+<span class="kw">from</span> utils.overlay <span class="kw">import</span> draw_face, draw_fps
+<span class="kw">from</span> utils.logger <span class="kw">import</span> EmotionLogger
+
+cap    = cv2.<span class="fn">VideoCapture</span>(<span class="nm">0</span>)
+logger = <span class="fn">EmotionLogger</span>()
+prev   = time.<span class="fn">time</span>()
+
+<span class="kw">while True</span>:
+    ret, frame = cap.<span class="fn">read</span>()
+    <span class="kw">if not</span> ret: <span class="kw">break</span>
+
+    faces = <span class="fn">detect_faces</span>(frame)
+    <span class="kw">for</span> (x, y, w, h) <span class="kw">in</span> faces:
+        roi = <span class="fn">crop_face</span>(frame, x, y, w, h)
+        emotion, conf, all_scores = <span class="fn">predict_from_roi</span>(roi)
+        <span class="fn">draw_face</span>(frame, x, y, w, h, emotion, conf)
+        logger.<span class="fn">log</span>(emotion, conf, all_scores)
+
+    now = time.<span class="fn">time</span>(); fps = <span class="nm">1</span> / (now - prev); prev = now
+    <span class="fn">draw_fps</span>(frame, fps)
+
+    cv2.<span class="fn">imshow</span>(<span class="st">'FER — Press Q to quit'</span>, frame)
+    <span class="kw">if</span> cv2.<span class="fn">waitKey</span>(<span class="nm">1</span>) <span class="op">&amp;</span> <span class="nm">0xFF</span> <span class="op">==</span> <span class="fn">ord</span>(<span class="st">'q'</span>):
+        <span class="kw">break</span>
+
+cap.<span class="fn">release</span>()
+cv2.<span class="fn">destroyAllWindows</span>()
+logger.<span class="fn">save</span>()</pre>
+  </div>
+</section>
+
+<!-- SECTION 7: PHASE 4 -->
+<section id="phase4">
+  <div class="section-num">// 07</div>
+  <h2>Phase 4 — Stats Logging &amp; Analytics</h2>
+
+  <div class="code-block">
+    <span class="filename">utils/logger.py</span>
+    <pre><span class="kw">import</span> csv, json
+<span class="kw">from</span> datetime <span class="kw">import</span> datetime
+<span class="kw">from</span> collections <span class="kw">import</span> defaultdict
+
+<span class="kw">class</span> <span class="fn">EmotionLogger</span>:
+    <span class="kw">def</span> <span class="fn">__init__</span>(self):
+        ts   = datetime.<span class="fn">now</span>().<span class="fn">strftime</span>(<span class="st">"%Y%m%d_%H%M%S"</span>)
+        self.csv_path  = <span class="st">f"logs/emotion_log_{ts}.csv"</span>
+        self.counts    = defaultdict(<span class="fn">int</span>)
+        self.rows      = []
+
+    <span class="kw">def</span> <span class="fn">log</span>(self, emotion, conf, all_scores):
+        self.counts[emotion] += <span class="nm">1</span>
+        self.rows.<span class="fn">append</span>({
+            <span class="st">'timestamp'</span>: datetime.<span class="fn">now</span>().<span class="fn">isoformat</span>(),
+            <span class="st">'emotion'</span>: emotion,
+            <span class="st">'confidence'</span>: <span class="fn">round</span>(conf, <span class="nm">4</span>),
+            **{k: <span class="fn">round</span>(<span class="fn">float</span>(v),<span class="nm">4</span>) <span class="kw">for</span> k,v <span class="kw">in</span> all_scores.<span class="fn">items</span>()}
+        })
+
+    <span class="kw">def</span> <span class="fn">save</span>(self):
+        <span class="kw">if not</span> self.rows: <span class="kw">return</span>
+        <span class="kw">with</span> <span class="fn">open</span>(self.csv_path, <span class="st">'w'</span>, newline=<span class="st">''</span>) <span class="kw">as</span> f:
+            writer = csv.<span class="fn">DictWriter</span>(f, fieldnames=self.rows[<span class="nm">0</span>].keys())
+            writer.<span class="fn">writeheader</span>(); writer.<span class="fn">writerows</span>(self.rows)
+        total = <span class="fn">sum</span>(self.counts.values())
+        summary = {k: {<span class="st">'count'</span>: v, <span class="st">'pct'</span>: <span class="fn">round</span>(v/total*<span class="nm">100</span>,<span class="nm">1</span>)}
+                   <span class="kw">for</span> k,v <span class="kw">in</span> self.counts.<span class="fn">items</span>()}
+        <span class="kw">with</span> <span class="fn">open</span>(<span class="st">'logs/session_summary.json'</span>, <span class="st">'w'</span>) <span class="kw">as</span> f:
+            json.<span class="fn">dump</span>(summary, f, indent=<span class="nm">2</span>)
+        <span class="fn">print</span>(<span class="st">f"[Logger] Saved {total} frames → {self.csv_path}"</span>)</pre>
+  </div>
+
+  <h3>Post-Session Analysis Plot</h3>
+  <div class="code-block">
+    <span class="filename">analyze_logs.py</span>
+    <pre><span class="kw">import</span> pandas <span class="kw">as</span> pd
+<span class="kw">import</span> matplotlib.pyplot <span class="kw">as</span> plt, json, glob
+
+df = pd.<span class="fn">read_csv</span>(<span class="fn">sorted</span>(<span class="fn">glob.glob</span>(<span class="st">'logs/*.csv'</span>))[-<span class="nm">1</span>])
+df[<span class="st">'timestamp'</span>] = pd.<span class="fn">to_datetime</span>(df[<span class="st">'timestamp'</span>])
+
+fig, (ax1, ax2) = plt.<span class="fn">subplots</span>(<span class="nm">1</span>, <span class="nm">2</span>, figsize=(<span class="nm">14</span>,<span class="nm">5</span>))
+
+<span class="cm"># Emotion distribution pie</span>
+counts = df[<span class="st">'emotion'</span>].<span class="fn">value_counts</span>()
+ax1.<span class="fn">pie</span>(counts, labels=counts.index, autopct=<span class="st">'%1.1f%%'</span>, startangle=<span class="nm">90</span>)
+ax1.<span class="fn">set_title</span>(<span class="st">'Emotion Distribution'</span>)
+
+<span class="cm"># Confidence over time</span>
+ax2.<span class="fn">plot</span>(df[<span class="st">'timestamp'</span>], df[<span class="st">'confidence'</span>], alpha=<span class="nm">0.6</span>, lw=<span class="nm">1</span>)
+ax2.<span class="fn">set_title</span>(<span class="st">'Confidence Over Time'</span>)
+ax2.<span class="fn">set_ylabel</span>(<span class="st">'Confidence'</span>); ax2.<span class="fn">set_ylim</span>(<span class="nm">0</span>,<span class="nm">1</span>)
+
+plt.<span class="fn">tight_layout</span>(); plt.<span class="fn">savefig</span>(<span class="st">'logs/session_plot.png'</span>, dpi=<span class="nm">150</span>)
+plt.<span class="fn">show</span>()</pre>
+  </div>
+</section>
+
+<!-- SECTION 8: MODEL COMPARISON -->
+<section id="models">
+  <div class="section-num">// 08</div>
+  <h2>Model Options &amp; Comparison</h2>
+
+  <table class="model-table">
+    <thead>
+      <tr>
+        <th>Approach</th>
+        <th>Speed</th>
+        <th>Accuracy</th>
+        <th>Ease</th>
+        <th>Notes</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>fer</strong> library <span class="tag-rec">⭐ Recommended</span></td>
+        <td>~20 FPS CPU</td>
+        <td>~65%</td>
+        <td>⭐⭐⭐⭐⭐</td>
+        <td>Plug-and-play, great for getting started fast</td>
+      </tr>
+      <tr>
+        <td><strong>DeepFace</strong></td>
+        <td>~10 FPS CPU</td>
+        <td>~70%</td>
+        <td>⭐⭐⭐⭐</td>
+        <td>Wraps multiple backends (VGG-Face, OpenFace)</td>
+      </tr>
+      <tr>
+        <td><strong>Custom FER-2013 CNN</strong></td>
+        <td>~25 FPS GPU</td>
+        <td>65–72%</td>
+        <td>⭐⭐⭐</td>
+        <td>Full control, best for learning the internals</td>
+      </tr>
+      <tr>
+        <td><strong>HuggingFace Transformer</strong></td>
+        <td>~5 FPS CPU</td>
+        <td>~75%+</td>
+        <td>⭐⭐⭐</td>
+        <td>Best accuracy; heavy model, needs GPU</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout tip">
+    <strong>Recommended path:</strong> Start with the <code>fer</code> library to get a working demo quickly, then swap in a custom Keras model once you understand the pipeline. This way you always have a running project to show.
+  </div>
+</section>
+
+<!-- SECTION 9: ROADMAP -->
+<section id="roadmap">
+  <div class="section-num">// 09</div>
+  <h2>Roadmap &amp; Enhancements</h2>
+  <p>Once the core pipeline is running, here's how to level it up progressively:</p>
+
+  <div class="timeline">
+    <div class="tl-item">
+      <div class="tl-dot"></div>
+      <div class="tl-phase">Phase 1 — Core</div>
+      <div class="tl-title">Basic Working Demo</div>
+      <div class="tl-desc">Webcam + face detection + single emotion label on screen. Get this working first, commit it.</div>
+    </div>
+    <div class="tl-item">
+      <div class="tl-dot"></div>
+      <div class="tl-phase">Phase 2 — Polish</div>
+      <div class="tl-title">Confidence + Multi-face + Logging</div>
+      <div class="tl-desc">Show all 7 emotion scores as a mini bar chart on overlay. Support multiple faces in frame. Add CSV logger.</div>
+    </div>
+    <div class="tl-item">
+      <div class="tl-dot"></div>
+      <div class="tl-phase">Phase 3 — Analytics</div>
+      <div class="tl-title">Session Stats Dashboard</div>
+      <div class="tl-desc">Run <code>analyze_logs.py</code> after each session. Generate pie charts, confidence trends, dominant emotion stats.</div>
+    </div>
+    <div class="tl-item">
+      <div class="tl-dot"></div>
+      <div class="tl-phase">Phase 4 — Advanced</div>
+      <div class="tl-title">Temporal Smoothing</div>
+      <div class="tl-desc">Average predictions over a rolling window of 5–10 frames to eliminate flickering. Use <code>collections.deque</code>.</div>
+    </div>
+    <div class="tl-item">
+      <div class="tl-dot"></div>
+      <div class="tl-phase">Phase 5 — Bonus</div>
+      <div class="tl-title">Web UI / Alert System</div>
+      <div class="tl-desc">Stream frames via Flask + Socket.IO to a browser dashboard. Add audio alert on detecting "angry" or "sad" emotion sustained for 5+ seconds.</div>
+    </div>
+  </div>
+
+  <div class="stat-row">
+    <div class="stat-box"><div class="val" style="color:#22c55e">7</div><div class="lbl">Emotions</div></div>
+    <div class="stat-box"><div class="val" style="color:#06b6d4">48px</div><div class="lbl">Model Input</div></div>
+    <div class="stat-box"><div class="val" style="color:#f59e0b">~65%</div><div class="lbl">FER-2013 Acc.</div></div>
+    <div class="stat-box"><div class="val" style="color:#a78bfa">20+</div><div class="lbl">Target FPS</div></div>
+  </div>
+
+  <div class="callout info">
+    <strong>Great additions for a portfolio project:</strong> Record a 60-second demo video, add a README with GIFs, and push to GitHub. Include a section explaining why FER-2013 accuracy is capped at ~72% (ambiguous labels, low resolution images).
+  </div>
+</section>
+
+<footer>
+  <p>Real-Time Facial Emotion Recognition — Project Guide</p>
+  <p style="margin-top:0.5rem; font-size:0.65rem;">FER-2013 · OpenCV · TensorFlow/Keras · DeepFace</p>
+</footer>
+
+</div>
+
+
+</body></html>
