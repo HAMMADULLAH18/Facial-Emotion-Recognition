@@ -8,7 +8,7 @@ import csv
 from datetime import datetime
 from collections import defaultdict, deque
 from PIL import Image
-from fer import FER
+from fer.fer import FER
 
 # ── Page config ───────────────────────────────────────────────
 st.set_page_config(
